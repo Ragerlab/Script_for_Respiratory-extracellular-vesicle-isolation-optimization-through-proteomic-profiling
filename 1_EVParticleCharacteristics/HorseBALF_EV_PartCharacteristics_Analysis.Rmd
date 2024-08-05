@@ -1,0 +1,514 @@
+---
+title: "Horse BALF EV Particle Characteristic Analysis Across Isolation Methods"
+output: html_document
+---
+
+# Set up workspace
+
+```{r message = FALSE, warning = FALSE}
+# Clear global environment
+rm(list=ls())
+
+# Load packages
+library(janitor) # for data cleaning
+library(openxlsx) # for writing out files
+library(tidyverse) # for data organization and manipulation
+library(patchwork) # for graphing
+library(ggpubr) # for normality testing QQ plot panel
+library(rstatix) # for statistical testing
+rename <- dplyr::rename
+select <- dplyr::select
+margin <- ggplot2::margin 
+
+# Set theme
+theme_set(theme_bw())
+```
+
+# Import data
+
+Import NTA data, BCA data, and the key that describes various changes in sample concentrations across experiments and throughout EV isolation steps. We will also recode some variables for easier readability of the manuscript:
+
++ Horse IDs from H1, H4, and H5 to H1, H2, and H3 
++ AFC (Automated Fraction Collector) to SEC (Size-Exclusion Chromatography)
+
+```{r}
+nta_df <- read.xlsx("1_InputData/Horse BALF EV Methods Compare NTA Data.xlsx") %>%
+  clean_names() %>%
+  rename("part_conc" = "original_concentration_particles_m_l") %>%
+  mutate(fraction_number = gsub("F", "", fraction_number)) %>%
+  mutate(sample_id = recode(sample_id, "H4" = "H2", "H5" = "H3")) %>%
+  mutate(method = gsub("AFC", "SEC", method))
+
+bca_df <- read.xlsx("1_InputData/Horse BALF EV Methods Compare MicroBCA Data.xlsx") %>%
+  mutate(sample_id = recode(sample_id, "H4" = "H2", "H5" = "H3")) %>%
+  mutate(method = gsub("AFC", "SEC", method))
+
+dilution_key_df <- read.xlsx("1_InputData/Horse BALF EV Methods Compare Dilution Master Sheet.xlsx") %>%
+  clean_names() %>%
+  mutate(sample_id = recode(sample_id, "H4" = "H2", "H5" = "H3")) %>%
+  mutate(method = gsub("AFC", "SEC", method))
+```
+
+# Fraction analysis of AFC samples
+
+The purpose of this section of the analysis is to determine which fractions' data will be used from AFC isolation to compare to microcentrifuge and ultracentrifuge data. This will be based on the total number of particles in each fraction.
+
+*Note:* Because different aliquots with different concentration factors were used as input in these experiments, we will normalize the data back to the original volume of un-concentrated BALF. 
+
+## Particle counts (NTA)
+
+Prepare data by joining on sample concentration information. 
+```{r}
+nta_df <- nta_df %>%
+  unite(sampleid_method, sample_id, method, sep = " ", remove = FALSE)
+
+dilution_key_df <- dilution_key_df %>%
+  unite(sampleid_method, sample_id, method, sep = " ", remove = FALSE)
+
+nta_df <- left_join(nta_df, dilution_key_df %>% select(-c(sample_id, method)), by = "sampleid_method")
+```
+
+Calculate total number of particles per 20 mL horse BALF by:
+
+1. Multiplying the particle concentration (particles per mL) by the volume the particles are suspended in (mL) to obtain total particles from that isolation. 
+2. Divide the total particles from the isolation by the input volume (mL) to get particles/mL in the concentrated sample.
+3. Multiply the particles/mL in step 2 by the total volume of concentrated BALF obtained to return the total number of particles theoretically contained in 20 mL undiluted horse BALF. 
+
+```{r}
+nta_df <- nta_df %>%
+  mutate(tot_particles = part_conc*ev_resuspend_vol/input_vol*conc_balf_vol)
+```
+
+Prepare data for graphing by generating mean and standard deviation values for each bar to be graphed:
+```{r}
+# Filter for only SEC
+nta_df_sec <- nta_df %>% filter(method == "SEC35nm" | method == "SEC70nm")
+
+# Calculate means of each fraction
+means_df_sec <- nta_df_sec %>%
+  unite(method_fraction, method, fraction_number, remove = FALSE, sep = "_") %>%
+  group_by(method_fraction) %>%
+  summarise(across(tot_particles, mean)) %>%
+  separate(method_fraction, into = c("method", "fraction_number"), remove = FALSE) %>%
+  rename("mean" = "tot_particles")
+
+# Calculate standard deviations of each fraction
+sds_df_sec <- nta_df_sec %>%
+  unite(method_fraction, method, fraction_number, remove = FALSE, sep = "_") %>%
+  group_by(method_fraction) %>%
+  summarise(across(tot_particles, sd)) %>%
+  separate(method_fraction, into = c("method", "fraction_number"), remove = FALSE) %>%
+  rename("sd" = "tot_particles")
+
+# Merge mean and standard deviation data data
+mean_sd_df_sec <- left_join(means_df_sec, sds_df_sec %>% select(c(method_fraction, sd)), 
+                     by = "method_fraction")
+```
+
+### SEC 35 nm 
+
+Filter data frames for only SEC 35 nm data.
+```{r}
+nta_df_sec_35 <- nta_df %>% filter(method == "SEC35nm")
+mean_sd_df_sec_35 <- mean_sd_df_sec %>% filter(method == "SEC35nm")
+```
+
+Create overall bar plot with mean +/- standard deviation for total particles.
+```{r}
+set.seed(8016)
+
+total_particles_35_all <- ggplot() +
+  geom_col(data = mean_sd_df_sec_35, aes(x = fraction_number, y = mean), color = "black", fill = "gray95") +
+  geom_errorbar(data = mean_sd_df_sec_35, aes(x = fraction_number, ymin = mean - sd, ymax = mean + sd, width = 0.2)) +
+  geom_jitter(data = nta_df_sec_35, aes (x = fraction_number, y = tot_particles, shape = sample_id, color = sample_id),
+              position = position_jitter(0.15), size = 2) +
+  scale_color_manual(values = c("#6ece58", "goldenrod1", "#31688e"), name = "Horse") +
+  scale_shape_manual(values = c(15, 16, 17), name = "Horse") +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) +
+  labs(y = "Total Particles\n(per 20 mL BALF)", x = "Fraction Number") +  
+  theme(strip.background = element_rect(fill = "gray28"),
+        strip.text = element_text(color = "white", face = "bold"),
+        axis.title.y = element_text(margin = margin(r = 10)),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.text = element_text(color = "black"),
+        legend.position = c(0.9, 0.8),
+        legend.background = element_rect(fill = "white", linewidth = 0.25, linetype = "solid", color = "black"))
+
+total_particles_35_all
+```
+
+Create panel with particle counts for individual horses.
+```{r}
+total_particles_35_byhorse <- ggplot(nta_df_sec_35, 
+                                     aes(x = fraction_number, y = tot_particles, fill = sample_id)) +
+  geom_col(color = "black") +
+  scale_fill_manual(values = c("#6ece58", "goldenrod1", "#31688e")) +
+  facet_wrap(~sample_id, scales = "free_y") +
+  labs(y = "Total Particles\n(per 20 mL BALF)", x = "Fraction Number") + 
+  theme(strip.background = element_rect(fill = "gray28"),
+        strip.text = element_text(color = "white", face = "bold"),
+        axis.title.y = element_text(margin = margin(r = 10)),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.text = element_text(color = "black"),
+        legend.position = "none")
+
+total_particles_35_byhorse
+```
+
+Combine these two plots into one panel.
+```{r}
+total_particles_panel_35 <- total_particles_35_all / total_particles_35_byhorse + plot_layout(heights = c(2, 1)) +
+  plot_annotation(tag_levels = 'A') &
+  theme(plot.tag = element_text(face = "bold", size = 16))
+
+total_particles_panel_35
+```
+Save plot.
+```{r}
+pdf(file = "2_OutputFigures/FractionSelection_SEC35_Panel.pdf",
+    height = 7, 
+    width = 8)
+
+total_particles_panel_35
+
+invisible(dev.off())
+```
+
+### SEC 70 nm
+
+Filter data frames for only SEC 35 nm data.
+```{r}
+nta_df_sec_70 <- nta_df %>% filter(method == "SEC70nm")
+mean_sd_df_sec_70 <- mean_sd_df_sec %>% filter(method == "SEC70nm")
+```
+
+Create overall bar plot with mean +/- standard deviation for total particles.
+```{r}
+set.seed(8016)
+
+total_particles_70_all <- ggplot() +
+  geom_col(data = mean_sd_df_sec_70, aes(x = fraction_number, y = mean), color = "black", fill = "gray95") +
+  geom_errorbar(data = mean_sd_df_sec_70, aes(x = fraction_number, ymin = mean - sd, ymax = mean + sd, width = 0.2)) +
+  geom_jitter(data = nta_df_sec_70, aes (x = fraction_number, y = tot_particles, shape = sample_id, color = sample_id),
+              position = position_jitter(0.15), size = 2) +
+  scale_color_manual(values = c("#6ece58", "goldenrod1", "#31688e"), name = "Horse") +
+  scale_shape_manual(values = c(15, 16, 17), name = "Horse") +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) +
+  labs(y = "Total Particles\n(per 20 mL BALF)", x = "Fraction Number") +  
+  theme(strip.background = element_rect(fill = "gray28"),
+        strip.text = element_text(color = "white", face = "bold"),
+        axis.title.y = element_text(margin = margin(r = 10)),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.text = element_text(color = "black"),
+        legend.position = c(0.9, 0.8),
+        legend.background = element_rect(fill = "white", linewidth = 0.25, linetype = "solid", color = "black"))
+
+total_particles_70_all
+```
+
+Create panel with particle counts for individual horses.
+```{r}
+total_particles_70_byhorse <- ggplot(nta_df_sec_70, 
+                                     aes(x = fraction_number, y = tot_particles, fill = sample_id)) +
+  geom_col(color = "black") +
+  scale_fill_manual(values = c("#6ece58", "goldenrod1", "#31688e")) +
+  facet_wrap(~sample_id, scales = "free_y") +
+  labs(y = "Total Particles\n(per 20 mL BALF)", x = "Fraction Number") + 
+  theme(strip.background = element_rect(fill = "gray28"),
+        strip.text = element_text(color = "white", face = "bold"),
+        axis.title.y = element_text(margin = margin(r = 10)),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.text = element_text(color = "black"),
+        legend.position = "none")
+
+total_particles_70_byhorse
+```
+
+Combine these two plots into one panel.
+```{r}
+total_particles_panel_70 <- total_particles_70_all / total_particles_70_byhorse + plot_layout(heights = c(2, 1)) +
+  plot_annotation(tag_levels = 'A') &
+  theme(plot.tag = element_text(face = "bold", size = 16))
+
+total_particles_panel_70
+```
+Save plot.
+```{r}
+pdf(file = "2_OutputFigures/FractionSelection_SEC70_Panel.pdf",
+    height = 7, 
+    width = 8)
+
+total_particles_panel_70
+
+invisible(dev.off())
+```
+
+### Conclusion
+
+Based on these plots, fractions 3 and 4 are the ones we will keep for further data analysis exploring differences in particle yield, particle characteristics, total protein, and proteomic profiles between isolation methods.
+
+## Fraction analysis of protein concentrations
+
+Calculate total protein (ug) per 20 mL horse BALF by:
+
+1. Multiplying the protein concentration (particles per mL) by the volume of the sample (mL) to obtain total protein from that isolation. 
+2. Divide the total protein from the isolation by the input volume (mL) to get protein/mL in the concentrated sample.
+3. Multiply the protein/mL in step 2 by the total volume of concentrated BALF obtained to return the total mass of protein theoretically contained in 20 mL undiluted horse BALF. 
+
+```{r}
+bca_df <- bca_df %>%
+  unite(sampleid_method, sample_id, method, remove = FALSE, sep = " ") %>%
+  left_join(dilution_key_df %>% select(-c(sample_id, method)), by = "sampleid_method") %>%
+  mutate(tot_prot = prot_conc*ev_resuspend_vol/input_vol*conc_balf_vol)
+```
+
+```{r}
+bca_df_sec <- bca_df %>% 
+  filter(method == "SEC35nm" | method == "SEC70nm") %>% 
+  mutate(method = recode(method, "SEC35nm" = "SEC 35nm", "SEC70nm" = "SEC 70nm")) %>%
+  mutate(fraction_number = as.character(fraction_number))
+
+bca_fraction_panel <- ggplot(bca_df_sec, aes(x = fraction_number, y = tot_prot)) +
+  geom_point(aes(color = sample_id, shape = sample_id)) +
+  geom_line(aes(color = sample_id, group = sampleid_method)) +
+  scale_color_manual(values = c("#6ece58", "goldenrod1", "#31688e"), name = "Horse") +
+  scale_shape_manual(values = c(15, 16, 17), name = "Horse") +
+  labs(x = "Fraction Number", y = "Total Protein (\u03BCg) per 20 mL BALF") +
+  facet_wrap(~method, nrow = 2) +
+  theme(strip.background = element_rect(fill = "gray28"),
+        strip.text = element_text(color = "white", face = "bold"),
+        axis.text = element_text(color = "black"))
+
+bca_fraction_panel
+
+ggsave("2_OutputFigures/FractionSelection_TotalProtein.png",
+    width = 8,
+    height = 5,
+    units = c("in"))
+```
+
+Notably more protein from the 35 nm column than 70 nm column. 
+
+# Comparison between EV isolation methods
+
+## Particle characteristics (NTA)
+
+Generate data representing the total number of particles from fractions 3 and 4 for each horse, then merge that data back with the NTA data for the other isolation methods.
+```{r}
+# Add together total number of particles from F3 and F4
+nta_df_sec_cleaned_conc <- nta_df_sec %>% 
+  filter(fraction_number == "3" | fraction_number == "4") %>%
+  group_by(sampleid_method) %>%
+  summarise(across(tot_particles, sum))
+
+# Average sizes across F3 and F4
+nta_df_sec_cleaned_size <- nta_df_sec %>% 
+  filter(fraction_number == "3" | fraction_number == "4") %>%
+  group_by(sampleid_method) %>%
+  summarise(across(x10:mean, mean))
+
+# Combine total particles and sizes for SEC
+nta_df_sec_cleaned <- left_join(nta_df_sec_cleaned_conc, nta_df_sec_cleaned_size, by = "sampleid_method")
+
+# Remove existing SEC data from the original NTA data frame and add back in new summed/averaged data
+nta_df_cleaned <- nta_df %>%
+  filter(method == "Microcentrifuge" | method == "Ultracentrifuge") %>%
+  select(c(sampleid_method, tot_particles, x10, x50, x90, mean)) %>%
+  bind_rows(nta_df_sec_cleaned)
+```
+
+Calculate mean of each parameter by method for supplemental table.
+```{r}
+nta_means_bymethod <- nta_df_cleaned %>%
+  separate(sampleid_method, into = c("sampleid", "method"), sep = " ") %>%
+  group_by(method) %>%
+  summarise(across(tot_particles:mean, \(x) mean(x))) %>%
+  pivot_longer(!method, names_to = "variable", values_to = "mean") %>%
+  unite(method_variable, method, variable, sep = " ", remove = FALSE)
+```
+
+Calculate SD of each parameter by method for supplemental table.
+```{r}
+nta_sds_bymethod <- nta_df_cleaned %>%
+  separate(sampleid_method, into = c("sampleid", "method"), sep = " ") %>%
+  group_by(method) %>%
+  summarise(across(tot_particles:mean, \(x) sd(x))) %>%
+  pivot_longer(!method, names_to = "variable", values_to = "sd") %>%
+  unite(method_variable, method, variable, sep = " ", remove = FALSE) %>%
+  select(c(method_variable, sd))
+```
+
+Combine means and SD for summary table.
+```{r}
+# Store plus/minus character
+plusminus <-"\u00b1"
+Encoding(plusminus)<-"UTF-8"
+
+# Merge dataframes, combine columns with plus minus symbol, and pivot wider
+nta_summstats_bymethod <- left_join(nta_means_bymethod, nta_sds_bymethod, by = "method_variable") %>%
+  mutate(mean = ifelse(mean > 1000, format(mean, scientific = TRUE, digits = 3), 
+                       format(mean, scientific = FALSE, digits = 2, trim = TRUE))) %>%
+  mutate(sd = ifelse(sd > 1000, format(sd, scientific = TRUE, digits = 3), 
+                       format(sd, scientific = FALSE, digits = 2, trim = TRUE))) %>%
+  mutate(mean_sd = paste(mean, plusminus, sd, sep = " ")) %>%
+  select(-c(method_variable, mean, sd)) %>%
+  pivot_wider(id_cols = method, names_from = "variable", values_from = "mean_sd")
+
+# Write out
+write.xlsx(nta_summstats_bymethod, "3_OutputTables/SummaryStatsByMethod.xlsx")
+```
+
+
+## Total protein (microBCA)
+
+Generate data representing the total protein from fractions 3 and 4 for each horse, then merge that data back with the protein data for the other isolation methods. 
+
+```{r}
+# Add together total protein from F3 and F4
+bca_df_sec_cleaned <- bca_df_sec %>%
+  filter(fraction_number == "3" | fraction_number == "4") %>%
+  group_by(sampleid_method) %>%
+  summarise(across(tot_prot, sum))
+
+# Remove existing SEC data from the original NTA data frame and add back in new summed/averaged data
+bca_df_cleaned <- bca_df %>%
+  filter(method == "Microcentrifuge" | method == "Ultracentrifuge") %>%
+  select(c(sampleid_method, tot_prot)) %>%
+  bind_rows(bca_df_sec_cleaned)
+```
+
+Calculate mean for supplemental table.
+```{r}
+bca_means_bymethod <- bca_df_cleaned %>%
+  separate(sampleid_method, into = c("sampleid", "method"), sep = " ") %>%
+  group_by(method) %>%
+  summarise(across(tot_prot, \(x) mean(x)))
+```
+
+Join summaries together and write out.
+```{r}
+write.xlsx(nta_means_bymethod %>% left_join(bca_means_bymethod, by = "method"),
+           "3_OutputTables/MeansByMethod.xlsx")
+```
+
+
+## Plotting data with statistics overlaid
+
+### Data Preparation
+```{r}
+# Combine NTA and BCA data and create columns for annotations
+all_data_cleaned_long <- nta_df_cleaned %>%
+  right_join(bca_df_cleaned, by = "sampleid_method") %>%
+  separate(sampleid_method, into = c("sample_id", "method"), sep =" ", remove = FALSE) %>%
+  pivot_longer(-c(sampleid_method:method), values_to = "value", names_to = "variable") %>%
+  mutate(method = recode(method, "SEC35nm" = "S35", "SEC70nm" = "S70", "Microcentrifuge" = "MC", "Ultracentrifuge" = "UC")) %>%
+  mutate(method = factor(method, levels = c("S35", "S70", "MC", "UC"))) %>%
+  mutate(variable = factor(variable, levels = c("tot_particles", "mean", "x10", "x50", "x90", "tot_prot")))
+```
+
+### Normality Assessment
+
+#### Qualitative
+```{r message = FALSE, fig.align = 'center'}
+# Set theme
+theme_set(theme_bw())
+
+# Make figure panel of histograms
+ggplot(all_data_cleaned_long, aes(value)) +
+  geom_histogram(fill = "gray40", color = "black", binwidth = function(x) {(max(x) - min(x))/25}) +
+  facet_wrap(~ variable, scales = "free", nrow = 2) +
+  labs(y = "# of Observations", x = "Value")
+```
+```{r}
+ggqqplot(all_data_cleaned_long, x = "value", facet.by = "variable", ggtheme = theme_bw(), scales = "free")
+```
+#### Quantitative
+
+```{r}
+# Make wide data frame
+all_data_cleaned_wide <- all_data_cleaned_long %>%
+  pivot_wider(id_cols = c(sampleid_method:method), names_from = "variable", values_from = "value")
+
+# Apply Shapiro-Wilk test
+shapiro_res <-  apply(all_data_cleaned_wide %>% select(-c(sampleid_method:method)), 2, shapiro.test)
+
+# Clean up results
+shapiro_res <- do.call(rbind.data.frame, shapiro_res)
+
+shapiro_res <- shapiro_res %>% 
+  mutate(normal = ifelse(p.value < 0.05, F, T)) %>%
+  select(c(p.value, normal)) 
+
+# View cleaned up dataframe
+shapiro_res
+```
+
+Based on the qualitative and quantitative normality testing results, we will use non-parametric tests, as we have a relatively small sample size and two of the endpoints are non-normally distributed.
+
+### Figure Panel Creation
+Plotting:
+```{r}
+# Create new labels
+new_labels <- c("tot_particles" = "Total Particles", "mean" = "Mean Diameter (nm)", "x10" = "10% Diameter (nm)", "x50" = "50% (Median) Diameter (nm)", "x90" = "90% Diameter (nm)", "tot_prot" = "Total Protein (\u03BCg)")
+ 
+# Plot data in figure panel
+method_compare_panel <- ggplot(all_data_cleaned_long) +
+  geom_boxplot(aes(x = method, y = value, fill = method), color = "black", outlier.shape = NA) +
+  scale_fill_viridis_d(begin = 0.25, end = 1, option = "D", name = "Method") +
+  geom_jitter(aes(x = method, y = value, shape = sample_id), color = "black", position = position_jitter(0.15), size = 2) +
+  scale_shape_manual(values = c(15, 16, 17), name = "Horse") +
+  stat_friedman_test(aes(x = method, y = value), 
+                     wid = "sample_id", 
+                     label = "p = {scales::pvalue(p, accuracy = 0.01)}",
+                     vjust = -3) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.5))) +
+  facet_wrap(~ variable , scales = "free_y", nrow = 2, labeller = labeller(variable = new_labels)) +
+  theme(axis.title = element_blank(),
+        strip.background = element_rect(fill = "gray28"),
+        strip.text = element_text(color = "white", face = "bold", size = 11),
+        axis.text = element_text(color = "black"),
+        axis.text.x = element_text(size = 11))
+  
+method_compare_panel
+```
+
+Some of the overall p-values are significant. Let's test for significant pairwise comparisons.
+
+```{r}
+# Create a vector with the names of the variables you want to run the test on
+endpoints <- colnames(all_data_cleaned_wide %>% select(tot_particles:tot_prot))
+
+# Create data frame to store results
+wilcox_posthoc <- data.frame()
+
+# Run for loop
+for (i in 1:length(endpoints)) {
+  
+  # Assign a name to the endpoint variable.
+  endpoint <- endpoints[i]
+  
+  # Run wilcox test and store in results data frame.
+  res <- all_data_cleaned_wide %>%
+    pairwise_wilcox_test(as.formula(paste0(endpoint, "~ method", sep = "")), 
+                         paired = TRUE, 
+                         p.adjust.method = "BH")
+  
+  wilcox_posthoc <- rbind(wilcox_posthoc, res)
+}
+
+# View results
+wilcox_posthoc
+```
+
+No significant pairwise differences between groups, likely due to low sample size and number of comparisons. 
+
+```{r}
+method_compare_panel
+
+ggsave("2_OutputFigures/MethodComparePanel.png",
+    width = 9,
+    height = 5,
+    units = c("in"))
+```
+
+

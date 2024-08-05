@@ -1,0 +1,1494 @@
+---
+title: "Horse BALF EV Proteomics Analysis Across Isolation Methods"
+output: html_document
+---
+
+# Set up workspace
+
+```{r message = FALSE, warning = FALSE}
+# Clear global environment
+rm(list=ls())
+
+# Load packages
+library(tidyverse) # for data organization and manipulation
+library(janitor) # for data cleaning
+library(openxlsx) # for reading in Excel files
+library(RUVSeq) # for exploring data normalization
+library(factoextra) # for PCA 
+library(pheatmap) # for heatmaps
+library(ggpubr) # for making qqplots
+library(rstatix) # for statistical tests
+library(ggvenn) # for Venn Diagrams
+library(snakecase) # for renaming columns
+library(patchwork) # for plotting
+rename <- dplyr::rename
+select <- dplyr::select
+
+# Set graphing theme
+theme_set(theme_bw())
+```
+
+# Import data
+
+```{r}
+# Master data frame
+all_data <- read.xlsx("1_InputData/Raw_Proteomics_Data_Cleaned.xlsx") %>%
+  clean_names() %>%
+  rename("protein" = "gene") %>%
+  
+  # Replace spaces and special symbols with periods so that accessions can be used in row names
+  mutate(accession = gsub("[^[:alnum:]]", ".", accession))
+```
+
+# Preliminary data exploration
+
+```{r}
+# How many total proteins were identified? 
+nrow(all_data)
+
+# How many unique proteins/genes?
+length(unique(all_data$protein))
+```
+
+# Data filtering 
+
+First, we will filter out proteins that had only 1 or 2 unique peptides, keeping those with 3 or more unique peptides. 
+```{r}
+data_filtered <- all_data %>% 
+  
+  # Filter by proteins that were identified by at least 3 peptides
+  filter(number_unique_peptides > 2) %>%
+
+  # Remove proteins called "[number] SV," which are actually peptides 
+  # where a gene symbol or location cannot be assigned.
+  filter(!protein %in% c("1 SV", "2 SV", "3 SV", "4 SV"))
+
+# How many total proteins/accessions?
+nrow(data_filtered)
+
+# How many unique proteins/genes?
+length(unique(data_filtered$protein))
+```
+
+Next, we will filter for proteins that were present in at least 2 out of 3 samples for ONE of the isolation methods.
+```{r message = FALSE}
+# Count how many NAs there are per protein and isolation method
+na_count_bymethod <- data_filtered %>%
+  
+  # Create transposed data frame
+  select(c(accession, h1_a35:h5_uc)) %>%
+  column_to_rownames("accession") %>%
+  t() %>% data.frame() %>%
+  
+  # Create grouping variable and pivot data longer so that it can be grouped by method
+  rownames_to_column("sample_id") %>%
+  separate(sample_id, into = c("horse", "method"), remove = FALSE) %>%
+  pivot_longer(-c(sample_id:method), names_to = "accession", values_to = "value") %>%
+  
+  # Summarize number of NAs by method and accession
+  group_by(method, accession) %>%
+  summarise(sum_na = sum(is.na(value))) %>%
+  
+  # Determine whether each accession will be kept in the dataset by assigning it a yes or no 
+  # based on whether any of the groups have 0 or 1 NAs
+  pivot_wider(id_cols = method, names_from = "accession", values_from = "sum_na") %>%
+  column_to_rownames("method") %>%
+  t() %>% data.frame()
+  
+na_count_bymethod <- na_count_bymethod %>%
+  mutate(keep = ifelse(apply(na_count_bymethod == 0, 1, any), "Y", 
+                       ifelse(apply(na_count_bymethod == 1, 1, any), "Y", "N")))
+
+  
+# Vector of accessions to keep
+keep_accession <- na_count_bymethod %>%
+  rownames_to_column("accession") %>%
+  filter(keep == "Y") %>%
+  pull(accession)
+
+# Filter data
+data_filtered <- data_filtered %>%
+  filter(accession %in% keep_accession)
+
+# How many accessions?
+nrow(data_filtered)
+
+# How many unique proteins?
+length(unique(data_filtered$protein))
+```
+
+```{r}
+# How many accessions have no missing data?
+count_nomissing <- data_filtered %>%
+  select(c(accession, h1_a35:h5_uc)) %>%
+  na.omit()
+
+nrow(count_nomissing)
+```
+
+Making supplemental table that contains entire dataset with annotations 
+
+
+# Exploration of filtered data
+
+## Protein abundance per sample
+
+Here, we plot the distribution of log2 protein abundance for each sample (omitting all of the values that are NA by changing them to 0 and not including them in the axes limits). We can see that, for the non-missing proteins, log2 data follow a roughly normal distribution across all samples and that MC/UC samples had overall fewer proteins. 
+```{r}
+# Data
+data_for_indiv_hist <- data_filtered %>%
+  mutate(across(h1_a35:h5_uc, log2)) %>%
+  select(c(accession, h1_a35:h5_uc)) %>%
+  column_to_rownames("accession") %>%
+  pivot_longer(all_of(everything()), names_to = "sample", values_to = "value") %>%
+  replace(is.na(.), 0)
+
+indiv_hist_counts <- ggplot(data_for_indiv_hist, aes(x = value)) +
+  geom_histogram(color = "black", 
+                 fill = "gray60",
+                 alpha = 0.7,
+                 binwidth = 1) +
+  ggtitle("Protein Abundance Distribution by Sample") +
+  ylab("Number of Proteins") +
+  xlab("Log2(Protein Abundance)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 16),
+        axis.title.x = element_text(margin = ggplot2::margin(t = 10), size = 13),
+        axis.title.y = element_text(margin = ggplot2::margin(r = 10), size = 13),
+        axis.text = element_text(size = 12)) +
+  scale_x_continuous(limits = c(15,35)) +
+  facet_wrap(~sample)
+
+indiv_hist_counts
+```
+
+## Relative log expression plot
+
+```{r warning = FALSE}
+# Prepare dataset
+data_for_relexprplot <- data_filtered %>%
+  select(c(accession, h1_a35:h5_uc)) %>%
+  column_to_rownames("accession") %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("sample_id") %>%
+  separate(sample_id, into = c("horse", "method"), remove = FALSE) %>%
+  mutate(across(c(horse:method), toupper)) %>%
+  select(-horse)
+
+# Store IDs as a separate vector
+ID <- data_for_relexprplot$sample_id
+
+# Store conditions as a separate vector
+groups <- as.factor(data_for_relexprplot$method)
+
+# Prepare dataset
+data_for_RLE <- data_filtered %>%
+  select(c(accession, h1_a35:h5_uc)) %>%
+  column_to_rownames("accession")
+
+# Create SeqExpressionSet
+exprSet <- newSeqExpressionSet(as.matrix(data_for_RLE),phenoData = 
+                                 data.frame(groups,row.names=colnames(data_for_RLE)))
+
+# Show groups whose distributions vary from the overall
+colors <- c("#3b528b", "#21918c", "#5ec962", "#fde725")
+plotRLE(exprSet, outline=FALSE, col = colors[groups])
+```
+
+Our relative log expression plot looks typical and does not suggest any batch effects or need for adjustment.
+
+## Missing data 
+
+How many total NA values are there by method for the accessions kept by our detection filter?
+
+```{r}
+# Sum of NA counts across all kept proteins by method
+na_count_bymethod_sum <- na_count_bymethod %>%
+  rownames_to_column("accession") %>%
+  filter(accession %in% keep_accession) %>%
+  select(c(a35:uc)) %>%
+  summarise_all(sum)
+
+na_count_bymethod_sum
+```
+
+Histogram of NA counts by accession:
+```{r warning = FALSE}
+# Create input data
+na_data_forhist <- na_count_bymethod %>%
+  rownames_to_column("accession") %>%
+  filter(accession %in% keep_accession) %>%
+  select(c(a35:uc)) %>%
+  mutate(sum = a35 + a70 + mc + uc)
+
+na_protein_hist <- ggplot(na_data_forhist, aes(x = sum)) +
+  geom_histogram(color = "black", 
+                 fill = "gray60",
+                 alpha = 0.7,
+                 binwidth = 1) +
+  ggtitle("Number of NAs per Accession") +
+  ylab("Number of NAs") +
+  xlab("Number of Accessions") +
+  scale_x_continuous(breaks = seq(0, 12, by = 1), limits = c(0, 12), expand = c(0.025, 0.025)) +
+  scale_y_continuous(breaks = seq(0, 100, by = 25), limits = c(0, 100), expand = c(0, 0)) +
+  theme(plot.title = element_text(hjust = 0.5, size = 16),
+        axis.title.x = element_text(margin = ggplot2::margin(t = 10), size = 13),
+        axis.title.y = element_text(margin = ggplot2::margin(r = 10), size = 13),
+        axis.text = element_text(size = 12))
+
+na_protein_hist
+```
+
+# Contaminant Proteins
+
+Prepare elements needed for making heat maps:1) A function for making unique names for duplicate proteins and a 2) key for going between protein name and accession). 
+
+First, the function for making unique names:
+```{r}
+# Function for making unique names 
+## Input = vector (x) and separation character(s) (sep) such as "_"
+## Output = vector with duplicated elements renamed with .1, .2, .3 appended (for example)
+make.unique = function(x, sep){
+    ave(x, x, FUN = function(a){if(length(a) > 1){paste(a, 1:length(a), sep = sep)} else {a}})
+}
+
+# Key to compare accessions and protein names
+accession_prot_key <- data_filtered %>% 
+  select(c(accession, protein))
+```
+
+Second, import MISEV annotation protein list and make list of subsets of contaminants:
+```{r}
+# Read in MISEV annotation data
+misev_prots <- read.xlsx("1_InputData/MISEV2018_Proteins.xlsx") %>% clean_names()
+
+# Vector of proteins to filter by
+misev_prots_cat3 <- misev_prots %>% 
+  filter(category == "3 - Major components of non-EV co-isolated structures") %>%
+  pull(protein_symbol)
+
+misev_prots_cat4 <- misev_prots %>% 
+  filter(category == "4 - Transmembrane, lipid-bound and soluble proteins associated to other intracellular compartments than PM/edosomes") %>%
+  pull(protein_symbol)
+
+corecontam_prots <- all_data %>% 
+  filter(contaminant == TRUE) %>%
+  pull(protein)
+```
+
+## Presence/absence count heatmap
+
+Extract data for proteins from each of these lists in a format that is prepared for making a heatmap:
+```{r}
+# Graphing data
+data_forgraphing <- data_filtered %>%
+  select(c(accession, h1_a35:h5_uc)) %>%
+  mutate(across(h1_a35:h5_uc, log2)) %>%
+  column_to_rownames("accession") %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("sample_id") %>%
+  separate(sample_id, into = c("horse", "method"), remove = FALSE) %>%
+  mutate(across(c(horse:method), toupper))
+
+head(data_forgraphing)[,1:6]
+
+# Function for additional data cleaning
+## Input: data frame formatted similar to data_forgraphing, vector of proteins to keep, and data frame of protein name/accession key
+## Output: data frame formatted for heatmap
+
+heatmap_data_prep_counts <- function(input_df, filtering_vec, protein_key){
+  
+  # Get accessions
+  accession_df <- protein_key %>%
+    filter(protein %in% filtering_vec)
+  
+  # Filter data
+  data <- input_df %>%
+    dplyr::select(c(sample_id, horse, method, all_of(accession_df$accession))) %>%
+    pivot_longer(-c(sample_id, horse, method), names_to = "accession", values_to = "value") %>%
+    left_join(accession_df, by = "accession") %>%
+    unite(protein_accession, protein, accession, sep = ".") %>%
+    group_by(method, protein_accession) %>%
+    summarise(sum = sum(!is.na(value))) %>%
+    pivot_wider(id_cols = "method", names_from = "protein_accession", values_from = "sum") %>%
+    mutate(method = recode(method, "A35" = "S35", "A70" = "S70")) %>%
+    mutate(method = factor(method, levels = c("S35", "S70", "MC", "UC"))) %>%
+    column_to_rownames("method") %>%
+    t() %>% data.frame() %>%
+    rownames_to_column("protein_accession") %>%
+    separate(protein_accession, into = c("protein", NA), sep = "[.]") %>%
+    mutate(protein = make.unique(protein, sep = "_Acc")) %>%
+    column_to_rownames("protein")
+  
+  return(data)
+}
+```
+
+Apply function for each of the protein subsets:
+```{r warning = FALSE, message = FALSE}
+# Apply function
+misev_cat3_forheatmap <- heatmap_data_prep_counts(data_forgraphing, misev_prots_cat3, accession_prot_key)
+misev_cat4_forheatmap <- heatmap_data_prep_counts(data_forgraphing, misev_prots_cat4, accession_prot_key)
+corecontam_forheatmap <- heatmap_data_prep_counts(data_forgraphing, corecontam_prots, accession_prot_key)
+
+# Add group name to each data frame
+misev_cat3_anno <- misev_cat3_forheatmap %>% 
+  mutate(Category = "MISEV 3: Non-EV Co-Isolated Structures") %>%
+  select(Category)
+
+misev_cat4_anno <- misev_cat4_forheatmap %>% 
+  mutate(Category = "MISEV 4: Other Intracellular Compartments") %>%
+  select(Category)
+
+corecontam_anno <- corecontam_forheatmap %>%
+  mutate(Category = "Non-Horse Proteins") %>%
+  select(Category)
+
+# Bind data frames together
+contaminant_heatmap_anno <- rbind(misev_cat3_anno, misev_cat4_anno, corecontam_anno) %>%
+  mutate(Category = factor(Category, levels = c("MISEV 3: Non-EV Co-Isolated Structures", 
+                                                "MISEV 4: Other Intracellular Compartments", "Non-Horse Proteins")))
+
+# Bind annotation data frames together
+contaminant_heatmap_data <- rbind(misev_cat3_forheatmap, misev_cat4_forheatmap, corecontam_forheatmap)
+
+# Define colors to be used to annotate the groups
+contaminant_heatmap_color <- list(Category = c("MISEV 3: Non-EV Co-Isolated Structures" = "#31688e", "MISEV 4: Other Intracellular Compartments" = "#35b779", "Non-Horse Proteins" = "#fde725"))
+
+# Add an index value into the dataframe so we can add splits between groups in heatmap
+contaminant_heatmap_anno$index <- 1:nrow(contaminant_heatmap_anno)
+
+# Make lists of where breaks should be placed in the heatmap to separate clusters of samples
+seprows <- contaminant_heatmap_anno %>% group_by(Category) %>% slice_max(n = 1, order_by = index)
+seprows <- sort(seprows$index)
+
+# Make heatmap
+contam_heatmap_counts <- pheatmap(as.matrix(contaminant_heatmap_data),
+         scale = "none",
+         color = colorRampPalette(c("grey95", "#443983"))(4),
+         legend_breaks = c(0, 1, 2, 3),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         angle_col = c("0"),
+         border_color = "black",
+         annotation_row = contaminant_heatmap_anno %>% select(Category),
+         annotation_colors = contaminant_heatmap_color,
+         annotation_names_row = FALSE,
+         gaps_row = seprows)
+
+pdf(file = "3_OutputFigs/Heatmap_Contaminants_Counts.pdf",
+    width = 6.5, height = 6)
+contam_heatmap_counts
+invisible(dev.off())
+
+contam_heatmap_counts
+```
+
+## Abundance heatmap
+
+```{r warning = FALSE, message = FALSE}
+# Function for additional data cleaning
+## Input: data frame formatted similar to data_forgraphing, vector of proteins to keep, and data frame of protein name/accession key
+## Output: data frame formatted for heatmap
+
+heatmap_data_prep_abun <- function(input_df, filtering_vec, protein_key){
+  
+  # Get accessions
+  accession_df <- protein_key %>%
+    filter(protein %in% filtering_vec)
+  
+  # Filter data
+  data <- input_df %>%
+    dplyr::select(c(sample_id, horse, method, all_of(accession_df$accession))) %>%
+    pivot_longer(-c(sample_id, horse, method), names_to = "accession", values_to = "value") %>%
+    left_join(accession_df, by = "accession") %>%
+    unite(protein_accession, protein, accession, sep = ".") %>%
+    group_by(method, protein_accession) %>%
+    summarise(mean = mean(value, na.rm = TRUE)) %>%
+    pivot_wider(id_cols = "method", names_from = "protein_accession", values_from = "mean") %>%
+    mutate(method = recode(method, "A35" = "S35", "A70" = "S70")) %>%
+    mutate(method = factor(method, levels = c("S35", "S70", "MC", "UC"))) %>%
+    column_to_rownames("method") %>%
+    t() %>% data.frame() %>%
+    rownames_to_column("protein_accession") %>%
+    separate(protein_accession, into = c("protein", NA), sep = "[.]") %>%
+    mutate(protein = make.unique(protein, sep = "_Acc")) %>%
+    column_to_rownames("protein")
+  
+  return(data)
+}
+
+# Apply function
+misev_cat3_forheatmap <- heatmap_data_prep_abun(data_forgraphing, misev_prots_cat3, accession_prot_key)
+misev_cat4_forheatmap <- heatmap_data_prep_abun(data_forgraphing, misev_prots_cat4, accession_prot_key)
+corecontam_forheatmap <- heatmap_data_prep_abun(data_forgraphing, corecontam_prots, accession_prot_key)
+
+## Using annotation and color data frame from above
+
+# Bind annotation data frames together
+contaminant_heatmap_data <- rbind(misev_cat3_forheatmap, misev_cat4_forheatmap, corecontam_forheatmap)
+
+# Make heatmap
+contam_heatmap_abun <- pheatmap(as.matrix(contaminant_heatmap_data),
+         scale = "none",
+         color = colorRampPalette(c("mistyrose", "violetred4"))(100),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         angle_col = c("0"),
+         border_color = "black",
+         annotation_row = contaminant_heatmap_anno %>% dplyr::select(Category),
+         annotation_colors = contaminant_heatmap_color,
+         annotation_names_row = FALSE,
+         gaps_row = seprows,
+         na_col = "white")
+
+pdf(file = "3_OutputFigs/Heatmap_Contaminants_Abundance.pdf",
+    width = 6.5, height = 6)
+contam_heatmap_abun
+invisible(dev.off())
+
+contam_heatmap_abun
+```
+
+# EV-specific proteins
+
+Prepare vectors to filter proteins by:
+```{r}
+# Vector of proteins to filter by - MISEV category 1
+
+## Get names of EV proteins in category 1
+misev_prots_cat1 <- misev_prots %>% 
+  filter(category == "1 - Transmembrane or GPI-anchored proteins associated to plasma membrane and/or endosomes") %>%
+  pull(protein_symbol)
+
+## Extract names with a star (to be searched against differently) in category 1
+misev_prots_cat1_general <- misev_prots_cat1[str_detect(misev_prots_cat1, "[*]")]
+misev_prots_cat1_general
+
+## Get all protein names in category 1
+misev_prots_cat1 <- accession_prot_key %>%
+  filter(protein %in% misev_prots_cat1 |
+           str_detect(protein, "^GNA") |
+           str_detect(protein, "^ITGA") |
+           str_detect(protein, "^ITGB") |
+           str_detect(protein, "^SDC") |
+           str_detect(protein, "^H2A") |
+           str_detect(protein, "^CD3")) %>%
+  pull(protein)
+
+# Vector of proteins to filter by - MISEV category 2
+
+## Get names of EV proteins in category 2
+misev_prots_cat2 <- misev_prots %>% 
+  filter(category == "2 - Cytosolic proteins recovered in EVs") %>%
+  pull(protein_symbol)
+
+# Extract names with a star (to be searched against differently) in category 2
+misev_prots_cat2_general <- misev_prots_cat2[str_detect(misev_prots_cat2, "[*]")]
+misev_prots_cat2_general
+
+# Get accessions
+misev_prots_cat2 <- accession_prot_key %>%
+  filter(protein %in% misev_prots_cat2 |
+           str_detect(protein, "^CHMP") |
+           str_detect(protein, "^CAV") |
+           str_detect(protein, "^EHD") |
+           str_detect(protein, "^ANXA") |
+           str_detect(protein, "^ACT") |
+           str_detect(protein, "^TUB")) %>%
+  pull(protein)
+```
+
+## Presence/absence count heatmap
+
+```{r message = FALSE}
+# Apply function
+misev_cat1_forheatmap <- heatmap_data_prep_counts(data_forgraphing, misev_prots_cat1, accession_prot_key)
+misev_cat2_forheatmap <- heatmap_data_prep_counts(data_forgraphing, misev_prots_cat2, accession_prot_key)
+
+# Add group name to each data frame
+misev_cat1_anno <- misev_cat1_forheatmap %>% 
+  mutate(Category = "MISEV 1: Transmembrane/GPI Anchored") %>%
+  select(Category)
+
+misev_cat2_anno <- misev_cat2_forheatmap %>% 
+  mutate(Category = "MISEV 2: Cytosolic Proteins in EVs") %>%
+  select(Category)
+
+# Bind data frames together
+marker_heatmap_anno <- rbind(misev_cat1_anno, misev_cat2_anno)
+
+# Bind annotation data frames together
+marker_heatmap_data <- rbind(misev_cat1_forheatmap, misev_cat2_forheatmap)
+
+# Define colors to be used to annotate the groups
+marker_heatmap_color <- list(Category = c("MISEV 1: Transmembrane/GPI Anchored" = "#21918c", "MISEV 2: Cytosolic Proteins in EVs" = "#90d743"))
+
+# Add an index value into the dataframe so we can add splits between groups in heatmap
+marker_heatmap_anno$index <- 1:nrow(marker_heatmap_anno)
+
+# Make lists of where breaks should be placed in the heatmap to separate clusters of samples
+seprows <- marker_heatmap_anno %>% group_by(Category) %>% slice_max(n = 1, order_by = index)
+seprows <- sort(seprows$index)
+
+# Make heatmap
+marker_heatmap_counts <- pheatmap(as.matrix(marker_heatmap_data),
+         scale = "none",
+         color = colorRampPalette(c("grey95", "#443983"))(4),
+         legend_breaks = c(0, 1, 2, 3),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         angle_col = c("0"),
+         border_color = "black",
+         fontsize_row = 8,
+         annotation_row = marker_heatmap_anno %>% select(Category),
+         annotation_colors = marker_heatmap_color,
+         annotation_names_row = FALSE,
+         gaps_row = seprows)
+
+pdf(file = "3_OutputFigs/Heatmap_Marker_Counts.pdf",
+    width = 6, height = 10)
+marker_heatmap_counts
+invisible(dev.off())
+
+marker_heatmap_counts
+```
+
+What is the count of EV markers with presence in all three horses across each method?
+```{r}
+marker_heatmap_data %>%
+  summarise(across(everything(), \(x) count (x == 3)))
+```
+
+
+## Protein abundance heat map
+
+```{r message = FALSE}
+# Apply function
+misev_cat1_forheatmap <- heatmap_data_prep_abun(data_forgraphing, misev_prots_cat1, accession_prot_key)
+misev_cat2_forheatmap <- heatmap_data_prep_abun(data_forgraphing, misev_prots_cat2, accession_prot_key)
+
+## Using annotation and color data frame from above
+
+# Bind annotation data frames together
+marker_heatmap_data <- rbind(misev_cat1_forheatmap, misev_cat2_forheatmap)
+
+# Make heatmap
+marker_heatmap_abun <- pheatmap(as.matrix(marker_heatmap_data),
+         scale = "none",
+         color = colorRampPalette(c("mistyrose", "violetred4"))(100),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         angle_col = c("0"),
+         border_color = "black",
+         fontsize_row = 8,
+         annotation_row = marker_heatmap_anno %>% select(Category),
+         annotation_colors = marker_heatmap_color,
+         annotation_names_row = FALSE,
+         gaps_row = seprows,
+         na_col = "white")
+
+pdf(file = "3_OutputFigs/Heatmap_Marker_Abundance.pdf",
+    width = 6, height = 10)
+marker_heatmap_abun
+invisible(dev.off())
+
+marker_heatmap_abun
+```
+
+# Cell-type specific proteins
+
+## Presence/count heat map
+
+```{r message = FALSE}
+ # Get vector to filter by
+celltype_prots <- accession_prot_key %>%
+  filter(str_detect(protein, "^CD[0-9]") |
+           str_detect(protein, "^LY6G") |
+           str_detect(protein, "^CCR") |
+           protein == "EPCAM") %>%
+  pull(protein)
+
+celltype_prots
+
+# Remove CD5L since it's not actually a cell surface molecule
+celltype_prots <- celltype_prots[!celltype_prots == "CD5L"]
+
+# Apply data cleaning function
+celltype_forheatmap <- heatmap_data_prep_counts(data_forgraphing, celltype_prots, accession_prot_key)
+
+# Make heatmap
+celltype_heatmap_counts <- pheatmap(as.matrix(celltype_forheatmap),
+         scale = "none",
+         color = colorRampPalette(c("grey95", "#443983"))(4),
+         legend_breaks = c(0, 1, 2, 3),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         angle_col = c("0"),
+         border_color = "black")
+
+pdf(file = "3_OutputFigs/Heatmap_CellType_Counts.pdf",
+    width = 2.75, height = 3)
+celltype_heatmap_counts
+invisible(dev.off())
+
+celltype_heatmap_counts
+```
+
+## Abundance heat map
+
+```{r message = FALSE}
+# Apply data cleaning function
+celltype_forheatmap <- heatmap_data_prep_abun(data_forgraphing, celltype_prots, accession_prot_key)
+
+# Make heatmap
+celltype_heatmap_abun <- pheatmap(as.matrix(celltype_forheatmap),
+         scale = "none",
+         color = colorRampPalette(c("mistyrose", "violetred4"))(100),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         angle_col = c("0"),
+         border_color = "black",
+         na_col = "white")
+
+pdf(file = "3_OutputFigs/Heatmap_CellType_Abundance.pdf",
+    width = 2.75, height = 3)
+celltype_heatmap_abun
+invisible(dev.off())
+
+celltype_heatmap_abun
+```
+
+# Analysis of overall protein cargo
+
+## Proteins with detectable levels in all samples
+
+Prepare data frame:
+```{r}
+# Filter for proteins without any missing expression
+data_filtered_nomissing <- data_filtered %>%
+  select(c(accession, protein, h1_a35:h5_uc)) %>%
+  na.omit()
+```
+
+### Variable by variable analysis
+
+#### Normality assessment
+
+Log2 transform data and assess normality.
+```{r}
+# Prepare data
+data_filtered_nomissing_log2 <- data_filtered_nomissing %>%
+  mutate(across(h1_a35:h5_uc, \(x) log2(x)))
+
+data_fornormalitytest <- data_filtered_nomissing_log2 %>%
+  select(-protein) %>%
+  remove_rownames() %>%
+  column_to_rownames("accession") %>%
+  t() %>% data.frame()
+
+# Write function for normality
+normality_assessment <- function(data) {
+  
+  ## [1] SHAPIRO WILK TEST WITH ALL ENDPOINTS
+  
+  # Test normality of each chemical
+  shapiro_wilk <- apply(data, 2, shapiro.test)
+  
+  # Create data frame to summarize results
+  shapiro_wilk <- do.call(rbind.data.frame, shapiro_wilk)
+  shapiro_wilk <- format(shapiro_wilk, scientific = FALSE)
+
+  # Add column to adjust for multiple hypothesis testing
+  shapiro_wilk$p.value.adj <- p.adjust(shapiro_wilk$p.value, "BH")
+  
+  # Add column for normality conclusion
+  shapiro_wilk <- shapiro_wilk %>% mutate(normal = ifelse(p.value.adj < 0.05, F, T))
+
+  ## [2] SHAPIRO WILK TEST SUMMARY
+  
+  # Make new data frame with summary values
+  shapiro_wilk_summ <- data.frame("count_normal" = nrow(shapiro_wilk %>% filter(p.value.adj >= 0.05)),
+                                 "count_nonnormal" = nrow(shapiro_wilk %>% filter(p.value.adj < 0.05))) %>%
+  mutate("perc_normal" = count_normal/(count_normal + count_nonnormal)*100)
+  
+  ## [3] PANEL OF HISTOGRAMS
+  
+  histograms <- data %>%
+  pivot_longer(all_of(colnames(data)), names_to = "endpoint", values_to = "value") %>%
+  ggplot(aes(value)) +
+  geom_histogram(fill = "gray32", color = "black") +
+  facet_wrap(~ endpoint, scales = "free")
+  
+  ## [4] PANEL OF QQ PLOTS
+  
+  qqplots <- ggqqplot(data %>%
+  pivot_longer(all_of(colnames(data)), names_to = "endpoint", values_to = "value"), 
+  "value", facet.by = "endpoint", ggtheme = theme_bw(), scales = "free")
+  
+  ## STORE RESULTS
+  results <- list(shapiro_wilk, shapiro_wilk_summ, histograms, qqplots)
+  return(results)
+
+}
+
+# Apply normality test
+normality_res <- normality_assessment(data_fornormalitytest)
+
+# View results
+normality_res[[2]]
+
+normality_res[[3]]
+
+normality_res[[4]]
+```
+
+Data are normally distributed, so we will proceed with ANOVA. 
+
+#### One-way RM ANOVA
+
+```{r}
+# Turn off scientific notation
+options(scipen=999)
+
+# Prepare data
+data_forstats <- data_fornormalitytest %>%
+  rownames_to_column("sample_id") %>%
+  separate(sample_id, into = c("horse", "method")) %>%
+  mutate(across(horse:method, toupper)) %>%
+  mutate(method = recode(method, "A35" = "S35", "A70" = "S70")) %>%
+  mutate(method = factor(method, levels = c("S35", "S70", "MC", "UC"))) %>%
+  mutate(horse = recode(horse, "H4" = "H2", "H5" = "H3"))
+
+# Create a list of the column names (accessions) to run the ANOVA on
+endpoints <- colnames(data_forstats[, 3:ncol(data_forstats)])
+
+# Create results data frame
+anova_res_nomissing <- data.frame()
+
+# Run ANOVA
+for (i in 1:length(endpoints)) {
+  
+  # Assign a name to the endpoint variable.
+  endpoint <- endpoints[i]
+  
+  # Run an one-way ANOVA and store results in res.aov
+  res.aov <- anova_test(data = data_forstats, 
+                        dv = paste0(endpoint), 
+                        wid = horse, 
+                        within = method)
+  
+  # Extract the results we are interested in.
+  res_df <- data.frame(get_anova_table(res.aov)) %>%
+    select(p) %>%
+    mutate(accession = paste0(endpoint)) %>%
+    relocate(accession, .before = "p")
+  
+  # Bind to results data frame
+  anova_res_nomissing <- rbind(anova_res_nomissing, res_df)
+}
+
+# Adjust p-values
+anova_res_nomissing$padj <- p.adjust(anova_res_nomissing$p, method = "BH")
+
+# How many have significant padj?
+nrow(anova_res_nomissing %>% filter(padj < 0.05))
+
+# Create cleaner results data frame to write out
+anova_res_nomissing_cleaned <- anova_res_nomissing %>%
+  left_join(accession_prot_key, by = "accession") %>%
+  relocate(protein, .after = "accession") %>%
+  mutate(across(c(p, padj), \(x) formatC(x, format = "e", digits = 2))) %>%
+  arrange(padj)
+  
+# Write out
+write.xlsx(anova_res_nomissing_cleaned, "2_OutputTables/ANOVA_Res_NoMissing.xlsx")
+```
+
+Next, follow up with posthoc pairwise testing.
+```{r}
+# Create results data frame
+pairwise_ttest_res_nomissing <- data.frame()
+
+# Run ANOVA
+for (i in 1:length(endpoints)) {
+  
+  # Assign a name to the endpoint variable.
+  endpoint <- endpoints[i]
+  
+  # Extract the results we are interested in.
+  res_df <- data_forstats %>%
+    pairwise_t_test(
+    as.formula(paste0(paste0(endpoint), "~", "method", sep = "")),
+    paired = TRUE, 
+    p.adjust.method = "BH")
+  
+  # Bind to results data frame
+  pairwise_ttest_res_nomissing <- rbind(pairwise_ttest_res_nomissing, res_df)
+  
+}
+
+# How many unique accessions with significant pairwise values?
+length(pairwise_ttest_res_nomissing %>%
+  filter(p.adj < 0.05) %>%
+  pull(".y.") %>%
+    unique())
+```
+
+Pull just accessions with significant pairwise comparisons and graph for supplemental material.
+```{r message = FALSE}
+# Clean data frame to begin prepping for graphing 
+pairwise_ttest_nomissing_forpanel <- pairwise_ttest_res_nomissing %>%
+  
+  # Filter to only significant p-values
+  filter(p.adj <= 0.05) %>%
+  
+  # Rename columns and join protein name
+  rename("accession" = ".y.", "Method" = "group2") %>%
+  
+  # Make new symbol for labels to differentiate between comparisons
+  mutate(label = group1) %>%
+  mutate(label = recode(group1, "S35" = "a", "S70" = "b", "MC" = "c")) %>%
+  
+  # Collapse labels
+  group_by(accession, Method) %>%
+  summarise(label = paste(label, collapse = ","))
+
+# Get names of accessions
+endpoints <- pairwise_ttest_nomissing_forpanel %>%
+  pull("accession") %>%
+  unique()
+
+# Add make unique column to accession protein key
+accession_prot_key_2 <- accession_prot_key %>%
+  mutate(protein = make.unique(protein, sep = "_Acc"))
+
+# Create data frame indicating where y value should be for these annotations
+sig_labs_y <- data_filtered_nomissing_log2 %>%
+  filter(accession %in% endpoints) %>%
+  column_to_rownames("accession") %>%
+  select(-protein) %>%
+  t() %>% as.data.frame() %>%
+  summarise(across(F7BUV8:F7CN11, \(x) max(x))) %>%
+  t() %>% as.data.frame() %>%
+  rownames_to_column("accession") %>%
+  rename("y_pos" = "V1") %>%
+  mutate(y_pos = y_pos*1.2) %>%
+  left_join(accession_prot_key_2, by = "accession")
+
+# Join to labeling dataframe to complete what is needed to make the annotations
+pairwise_ttest_nomissing_forpanel <- pairwise_ttest_nomissing_forpanel %>%
+  left_join(sig_labs_y, by = "accession")
+
+# Pivot data longer and format for graphing
+ttest_nomissing_data_forpanel <- data_filtered_nomissing_log2 %>%
+  filter(accession %in% endpoints) %>%
+  select(-protein) %>%
+  pivot_longer(!accession, names_to = "sample", values_to = "value") %>%
+  left_join(accession_prot_key_2, by = "accession") %>%
+  separate(sample, into = c("Horse", "Method")) %>%
+  mutate(across(c(Horse:Method), \(x) toupper(x))) %>%
+  mutate(Method = recode(Method, "A35" = "S35", "A70" = "S70")) %>%
+  mutate(Method = factor(Method, levels = c("S35", "S70", "MC", "UC"))) %>%
+  mutate(Horse = recode(Horse, "H4" = "H2", "H5" = "H3"))
+
+# Make panel
+ttest_panel <- ggplot(ttest_nomissing_data_forpanel) +
+  geom_boxplot(aes(x = Method, y = value, fill = Method), color = "black", outlier.shape = NA) +
+  scale_fill_viridis_d(begin = 0.25, end = 1, option = "D", name = "Method") +
+  geom_jitter(aes(x = Method, y = value, shape = Horse), color = "black", 
+              position = position_jitter(0.15), size = 2) +
+  scale_shape_manual(values = c(15, 16, 17), name = "Horse") +
+  geom_text(data = pairwise_ttest_nomissing_forpanel, aes(x = Method, y = y_pos, label = label), 
+            size = 4, hjust = 0.5, fontface = "bold") +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.35))) +
+  ylab(expression(Log[2]*"(Relative Abundance)")) +
+  facet_wrap(~ protein, scales = "free_y", nrow = 5) +
+  theme(axis.title.x = element_blank(),
+        strip.background = element_rect(fill = "gray28"),
+        strip.text = element_text(color = "white", face = "bold", size = 11),
+        axis.text = element_text(color = "black"),
+        axis.text.x = element_text(size = 11),
+        axis.title.y = element_text(size = 11),
+        legend.position = "none")
+
+ttest_panel
+
+ggsave("3_OutputFigs/TTest_Panel_NoMissing.png",
+    width = 9,
+    height = 9,
+    units = c("in"))
+```
+
+We can also plot these proteins as a heatmap (for main body of manuscript):
+```{r}
+# Filter data
+data_anovasig_nomissing_forheatmap <- data_forstats %>%
+  unite(horse_method, horse, method, sep = "_", remove = FALSE)
+
+sample_anno <- data_anovasig_nomissing_forheatmap %>%
+  select(c(horse_method:method)) %>%
+  dplyr::rename("Method" = "method", "Horse" = "horse") %>%
+  column_to_rownames("horse_method")
+
+data_anovasig_nomissing_forheatmap <- data_anovasig_nomissing_forheatmap %>%
+  column_to_rownames("horse_method") %>%
+  select(-c(method, horse)) %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("accession") %>%
+  left_join(accession_prot_key_2, by = "accession") %>%
+  column_to_rownames("protein") %>%
+  select(-accession)
+
+# Define colors to be used to annotate the groups
+heatmap_color <- list(Method = c("S35" = "#3b528b", "S70" = "#21918c", 
+                                          "MC" = "#5ec962", "UC" = "#fde725"),
+                               Horse = c("H1" = "grey75", "H2" = "grey55", "H3" = "grey35"))
+
+
+
+# Make heatmap
+heatmap_nomissing <- pheatmap(as.matrix(data_anovasig_nomissing_forheatmap),
+         scale = "none",
+         color = colorRampPalette(c("mistyrose", "violetred4"))(100),
+         angle_col = c("0"),
+         border_color = "black",
+         fontsize_row = 8,
+         show_colnames = FALSE,
+         annotation_col = sample_anno,
+         annotation_colors = heatmap_color,
+         annotation_names_col = FALSE)
+
+pdf(file = "3_OutputFigs/Heatmap_AllProts_NoMissing.pdf",
+    width = 7, height = 9)
+heatmap_nomissing
+invisible(dev.off())
+
+heatmap_nomissing
+```
+
+### PCA Plot
+
+PCA plot:
+```{r}
+# Prep data
+data_for_pca_nomissing <- data_forstats %>%
+  unite(horse_method, horse, method, sep = "_") %>%
+  column_to_rownames("horse_method") %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("accession") %>%
+  left_join(accession_prot_key_2, by = "accession") %>%
+  select(-accession) %>%
+  column_to_rownames("protein") %>% t()
+
+# Run PCA
+pca_res_counts <- prcomp(data_for_pca_nomissing)
+
+# PCA plot
+pca_plot_nomissing <- fviz_pca_ind(pca_res_counts, 
+             label = "none",
+             alpha = 0,
+             mean.point = FALSE) +
+  geom_point(aes(shape = sample_anno$Horse, color = sample_anno$Method), size = 4) +
+  scale_shape_manual(values = c(15, 16, 17), name = "Horse") +
+  scale_color_viridis_d(begin = 0.25, end = 1, option = "D", name = "Method") +
+  labs(title = "Proteins with No Missing Data",
+       subtitle = "(n = 62 proteins)") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(color = "black"),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(), 
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 14),
+      legend.text = element_text(size = 12),
+      legend.title = element_text(size = 12))
+
+# Write out plot
+pdf(file = "3_OutputFigs/PCAPlot_Log2DataNoMissing.pdf",
+    width = 5, height = 3.75)
+pca_plot_nomissing
+invisible(dev.off())
+
+pca_plot_nomissing
+```
+
+Plot contributions to dimension 1, since that is where we see most of the variability:
+```{r}
+pca_contrib_plot_nomissing <- fviz_contrib(pca_res_counts, choice = "var", axes = 1, top = 10,
+             color = "black",
+             fill = "grey70") +
+  ggtitle("Contribution of Variables to Dim1") +
+  theme_set(theme_bw()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 15),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 13, margin = ggplot2::margin(r = 10)),
+        axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 11),
+        axis.text.y = element_text(color = "black", size = 11),
+        plot.margin = unit(c(0.2, 0.2, 0.2, 0.2), "inches"))
+
+# Write out plot
+pdf(file = "3_OutputFigs/PCAContrib_Log2DataNoMissing.pdf",
+    width = 5, height = 3.75)
+pca_contrib_plot_nomissing
+invisible(dev.off())
+
+pca_contrib_plot_nomissing
+```
+
+PCA contributions to scatter plot:
+```{r}
+labels_pca <- c("SFTPD", "APOE", "SFTPB", "APOA1_Acc2", "IGHM_Acc1", "IGHM_Acc4", "GC")
+
+pca_biplot <- fviz_pca_biplot(pca_res_counts, label ="var",
+                invisible = "ind",
+                col.var = "black",
+                select.var = list(name = labels_pca),
+                alpha.var = 0.3,
+                repel = TRUE) +
+  labs(title = "Proteins with No Missing Data",
+       subtitle = "(n = 62 proteins)") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(color = "black"),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(), 
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 14),
+      legend.text = element_text(size = 12),
+      legend.title = element_text(size = 12))
+
+pdf(file = "3_OutputFigs/PCABiplot_Log2DataNoMissing.pdf",
+    width = 5, height = 4)
+pca_biplot
+invisible(dev.off())
+```
+
+## Imputed data
+
+### GSimp Imputation
+
+Import functions:
+
+```{r message = FALSE, warning = FALSE}
+# Load GSimp functions
+options(stringsAsFactors = F)
+
+source('~/Library/CloudStorage/OneDrive-UniversityofNorthCarolinaatChapelHill/Rager_Lab/Projects_Lead/4_HorseBALF_EVs/3_IsolationOptimizationExperiments/6_DataAnalysis/2_Proteomics/4_GSimpFunctions/Trunc_KNN/Imput_funcs.r', local = TRUE)
+
+source('~/Library/CloudStorage/OneDrive-UniversityofNorthCarolinaatChapelHill/Rager_Lab/Projects_Lead/4_HorseBALF_EVs/3_IsolationOptimizationExperiments/6_DataAnalysis/2_Proteomics/4_GSimpFunctions/GSimp_evaluation.R', local = TRUE)
+
+source('~/Library/CloudStorage/OneDrive-UniversityofNorthCarolinaatChapelHill/Rager_Lab/Projects_Lead/4_HorseBALF_EVs/3_IsolationOptimizationExperiments/6_DataAnalysis/2_Proteomics/4_GSimpFunctions/GSimp.R', local = TRUE)
+```
+
+Prepare input data. The input for this function is the detection-filtered data frame with the minimum values added as the last row in the data frame (proteins in columns and samples in rows). Note that the imputation will take a few minutes to run. 
+
+```{r}
+# Make a vector of the minimum values for each accession
+min_detect <- data_filtered %>%
+  dplyr::select(c(accession, h1_a35:h5_uc)) %>%
+  pivot_longer(!accession, names_to = "sample", values_to = "value") %>%
+  group_by(accession) %>%
+  summarise(mdl = min(value, na.rm = TRUE))
+
+# Add values to data frame
+data_filtered_forGSimp <- data_filtered %>%
+  dplyr::select(c(accession, h1_a35:h5_uc)) %>%
+  left_join(min_detect, by = "accession") %>%
+  column_to_rownames("accession") %>%
+  t() %>% as.data.frame()
+
+# Apply function
+set.seed(8016)
+data_filtered_imp <- pre_processing_GS_wrapper(data_filtered_forGSimp)
+```
+
+### PCA Plot
+
+```{r}
+# Prepare Log2 Data
+data_filtered_imp_log2_forpca <- log2(data_filtered_imp) %>%
+  rownames_to_column("horse_method") %>%
+  separate(horse_method, into = c("Horse", "Method")) %>%
+  mutate(across(c(Horse:Method), \(x) toupper(x))) %>%
+  mutate(Method = recode(Method, "A35" = "S35", "A70" = "S70")) %>%
+  mutate(Method = factor(Method, levels = c("S35", "S70", "MC", "UC"))) %>%
+  mutate(Horse = recode(Horse, "H4" = "H2", "H5" = "H3")) %>%
+  unite(horse_method, Horse, Method, remove = TRUE) %>%
+  column_to_rownames("horse_method") %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("accession") %>%
+  left_join(accession_prot_key, by = "accession") %>%
+  mutate(protein = make.unique(protein, "_Acc")) %>%
+  select(-accession) %>%
+  column_to_rownames("protein") %>% t()
+
+# Run PCA
+pca_res_imp <- prcomp(as.matrix(data_filtered_imp_log2_forpca))
+
+# PCA plot
+pca_plot_imp <- fviz_pca_ind(pca_res_imp, 
+             label = "none",
+             alpha = 0,
+             mean.point = FALSE) +
+  geom_point(aes(shape = sample_anno$Horse, color = sample_anno$Method), size = 4) +
+  scale_shape_manual(values = c(15, 16, 17), name = "Horse") +
+  scale_color_viridis_d(begin = 0.25, end = 1, option = "D", name = "Method") +
+  labs(title = "All Proteins Passing Detection Filter",
+       subtitle = "(n = 564 proteins)") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(color = "black"),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(), 
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 14),
+      legend.text = element_text(size = 12),
+      legend.title = element_text(size = 12))
+
+# Write out plot
+pdf(file = "3_OutputFigs/PCAPlot_ImpLog2Data.pdf",
+    width = 5, height = 3.75)
+pca_plot_imp
+invisible(dev.off())
+
+pca_plot_imp
+```
+
+Plot contributions:
+```{r}
+pca_contrib_plot_imp <- fviz_contrib(pca_res_imp, choice = "var", axes = 1, top = 10,
+             color = "black",
+             fill = "grey70") +
+  ggtitle("Contribution of Variables to Dim1") +
+  theme_set(theme_bw()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 15),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 13, margin = ggplot2::margin(r = 10)),
+        axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 11),
+        axis.text.y = element_text(color = "black", size = 11),
+        plot.margin = unit(c(0.2, 0.2, 0.2, 0.2), "inches"))
+
+# Write out plot
+pdf(file = "3_OutputFigs/PCAContrib_ImpLog2Data.pdf",
+    width = 5, height = 3.75)
+pca_contrib_plot_imp
+invisible(dev.off())
+
+pca_contrib_plot_imp
+```
+PCA contributions to scatter plot:
+```{r}
+# Select labels
+labels_pca_imp <- c("MUC1", "GPRC5C", "SDCBP", "SFTPD", "MFGE8", "GNB1", "RAC1")
+
+pca_biplot_imp <- fviz_pca_biplot(pca_res_imp, label ="var",
+                invisible = "ind",
+                col.var = "black",
+                select.var = list(name = labels_pca_imp),
+                alpha.var = 0.3,
+                repel = TRUE) +
+  labs(title = "All Proteins Passing Detection Filter",
+       subtitle = "(n = 564 proteins)") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(color = "black"),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(), 
+      plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 14),
+      legend.text = element_text(size = 12),
+      legend.title = element_text(size = 12))
+
+pdf(file = "3_OutputFigs/PCABiplot_ImpLog2Data.pdf",
+    width = 5, height = 4)
+pca_biplot_imp
+invisible(dev.off())
+```
+
+
+
+## Heatmap 
+```{r}
+# Log2 and prep data
+data_filtered_imp_log2 <- log2(data_filtered_imp) %>%
+  rownames_to_column("horse_method") %>%
+  separate(horse_method, into = c("Horse", "Method")) %>%
+  mutate(across(c(Horse:Method), \(x) toupper(x))) %>%
+  mutate(Method = recode(Method, "A35" = "S35", "A70" = "S70")) %>%
+  mutate(Method = factor(Method, levels = c("S35", "S70", "MC", "UC"))) %>%
+  mutate(Horse = recode(Horse, "H4" = "H2", "H5" = "H3")) %>%
+  unite(horse_method, Horse, Method, remove = TRUE) %>%
+  column_to_rownames("horse_method")
+
+# Prep data
+data_filtered_forheatmap <- data_filtered_imp_log2 %>% t()
+
+# Make heatmap
+allprots_heatmap <- pheatmap(data_filtered_forheatmap,
+         scale = "none",
+         color = colorRampPalette(c("mistyrose", "violetred4"))(100),
+         angle_col = c("0"),
+         border_color = "black",
+         show_colnames = FALSE,
+         show_rownames = FALSE,
+         annotation_col = sample_anno,
+         annotation_colors = heatmap_color,
+         annotation_names_col = FALSE)
+
+allprots_heatmap
+
+pdf(file = "3_OutputFigs/Heatmap_AllProts_Imp.pdf",
+    width = 7, height = 9)
+allprots_heatmap
+invisible(dev.off())
+
+allprots_heatmap
+```
+
+# IPA 
+
+## Export data for IPA analysis
+
+Protein lists by method for IPA input and visualization (keeping proteins with detectable protein in 2 out of 3 horses). Note that for these, I kept the prefix as A (as in AFC) rather than S (SEC), so as to not need to repeat the IPA analysis, but they are equivalent. 
+```{r}
+# Make list of all contaminating proteins to remove
+all_contams <- c(misev_prots_cat3, misev_prots_cat4, corecontam_prots)
+
+# Filter and export data
+a35_keep_forIPA <- na_count_bymethod %>%
+  rownames_to_column("accession") %>%
+  filter(accession %in% keep_accession) %>%
+  filter(a35 < 2) %>%
+  left_join(accession_prot_key, by = "accession") %>%
+  distinct(protein) %>%
+  filter(!protein %in% all_contams) %>%
+  select(protein)
+
+write.xlsx(a35_keep_forIPA, "2_OutputTables/ProteinsForIPA_A35.xlsx")
+
+a70_keep_forIPA <- na_count_bymethod %>%
+  rownames_to_column("accession") %>%
+  filter(accession %in% keep_accession) %>%
+  filter(a70 < 2) %>%
+  left_join(accession_prot_key, by = "accession") %>%
+  distinct(protein) %>%
+  filter(!protein %in% all_contams) %>%
+  select(protein)
+
+write.xlsx(a70_keep_forIPA, "2_OutputTables/ProteinsForIPA_A70.xlsx")
+
+mc_keep_forIPA <- na_count_bymethod %>%
+  rownames_to_column("accession") %>%
+  filter(accession %in% keep_accession) %>%
+  filter(mc < 2) %>%
+  left_join(accession_prot_key, by = "accession") %>%
+  distinct(protein) %>%
+  filter(!protein %in% all_contams) %>%
+  select(protein)
+
+write.xlsx(mc_keep_forIPA, "2_OutputTables/ProteinsForIPA_MC.xlsx")
+
+uc_keep_forIPA <- na_count_bymethod %>%
+  rownames_to_column("accession") %>%
+  filter(accession %in% keep_accession) %>%
+  filter(uc < 2) %>%
+  left_join(accession_prot_key, by = "accession") %>%
+  distinct(protein) %>%
+  filter(!protein %in% all_contams) %>%
+  select(protein)
+
+write.xlsx(uc_keep_forIPA, "2_OutputTables/ProteinsForIPA_UC.xlsx")
+```
+
+## Make Venn Diagram of Proteins
+
+Venn Diagram of Proteins:
+```{r}
+# Prepare data
+venn_protein_input <- list(
+  S35 = a35_keep_forIPA %>% pull(protein),
+  S70 = a70_keep_forIPA %>% pull(protein),
+  MC = mc_keep_forIPA %>% pull(protein),
+  UC = uc_keep_forIPA %>% pull(protein)
+)
+
+# Graph Data
+protein_venn <- ggvenn(venn_protein_input, 
+       fill_color = c("#3b528b", "#21918c","#5ec962", "#fde725"),
+       show_percentage = FALSE,
+       fill_alpha = 0.5,
+       text_size = 7)
+
+pdf("3_OutputFigs/VennDiagram_Protein.pdf",
+    width = 5, height = 5)
+protein_venn
+invisible(dev.off())
+
+protein_venn
+```
+
+## Plot IPA Results
+
+Pathways analysis
+```{r}
+# Import data
+ipa_paths_a35 <- read.xlsx("1_InputData/IPA_A35.xlsx") %>% clean_names() %>% mutate(method = "S35")
+ipa_paths_a70 <- read.xlsx("1_InputData/IPA_A70.xlsx") %>% clean_names() %>% mutate(method = "S70")
+ipa_paths_mc <- read.xlsx("1_InputData/IPA_MC.xlsx") %>% clean_names() %>% mutate(method = "MC")
+ipa_paths_uc <- read.xlsx("1_InputData/IPA_UC.xlsx") %>% clean_names() %>% mutate(method = "UC")
+
+# Bind together
+ipa_paths_all <- rbind(ipa_paths_a35, ipa_paths_a70, ipa_paths_mc, ipa_paths_uc)
+
+# Distribution of p-values
+ipa_paths_all %>%
+  ggplot(aes(log_b_h_p_value)) +
+  geom_histogram(fill = "gray32", color = "black") +
+  facet_wrap(~ method) +
+  scale_x_log10()
+
+# Distribution of ratios
+ipa_paths_all %>%
+  ggplot(aes(ratio)) +
+  geom_histogram(fill = "gray32", color = "black") +
+  facet_wrap(~ method) +
+  scale_x_log10()
+
+# How many pathways have p < 0.05?
+ipa_paths_all %>% 
+  group_by(method) %>%
+  dplyr::summarize(n = sum(log_b_h_p_value < 1.3))
+
+# What is the overlap in pathways between methods?
+venn_protein_input <- list(
+  S35 = ipa_paths_a35 %>% filter(log_b_h_p_value > 1.3) %>% pull(ingenuity_canonical_pathways),
+  S70 = ipa_paths_a70 %>% filter(log_b_h_p_value > 1.3) %>% pull(ingenuity_canonical_pathways),
+  MC = ipa_paths_mc %>% filter(log_b_h_p_value > 1.3) %>% pull(ingenuity_canonical_pathways),
+  UC = ipa_paths_uc %>% filter(log_b_h_p_value > 1.3) %>% pull(ingenuity_canonical_pathways)
+)
+
+# Graph Data
+pathway_venn <- ggvenn(venn_protein_input, 
+       fill_color = c("#3b528b", "#21918c","#5ec962", "#fde725"),
+       show_percentage = FALSE,
+       fill_alpha = 0.5,
+       text_size = 7)
+
+pdf("3_OutputFigs/VennDiagram_Pathway.pdf",
+    width = 5, height = 5)
+pathway_venn
+invisible(dev.off())
+
+pathway_venn
+```
+
+Plot top pathways, where bars are highlighted if they are shared between all of the methods in significance. 
+```{r}
+# Get pathways that overlap
+overlap_pathways <- base::Reduce(intersect, venn_protein_input)
+
+# Write function for graphing
+# This function takes your input data frame (data), colors for the gradient scale (high color and low color), the number of pathways you want (n), and your comparison subtitle (subtitle) as input
+# And outputs the graph of interest
+graph_top_canon_2 <- function(data, n, title) {
+  
+  data %>% 
+  slice_head(n = n) %>%
+    mutate(shared_path = ifelse(ingenuity_canonical_pathways %in% overlap_pathways, "Yes", "No")) %>%
+    mutate(shared_path = factor(shared_path, levels = c("Yes", "No"))) %>%
+    mutate(n_molecules = count.fields(textConnection(molecules), sep = ",")) %>%
+  ggplot(aes(x =log_b_h_p_value, y = reorder(ingenuity_canonical_pathways, log_b_h_p_value), fill = shared_path)) +
+  scale_x_continuous(limits = c(0, 70), expand = c(0, 0)) +
+  scale_fill_manual(values = c("violetred4", "grey80")) +
+  geom_bar(colour="black", stat = "identity", width = 0.6) +
+  geom_text(aes(label = n_molecules), hjust = -0.3, size = 9) +
+  labs(title = paste0(title), x = "-log(BH p-value)", fill = "Shared\nPathway?") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 34),
+        axis.title.y = element_blank(), 
+        axis.text.y = element_text(colour = "black", size = 26),
+        axis.title.x = element_text(size = 26), 
+        axis.text.x = element_text(colour = "black", size = 22),
+        legend.title = element_text(size = 22),
+        legend.text = element_text(size = 22),
+        legend.key.size = unit(8, 'mm'),
+        panel.border = element_blank(),
+        legend.position = c(0.8, 0.4),
+        plot.margin = unit(c(0.3, 0.3, 0.3, 0.3), "inches")
+        ) 
+  
+}
+
+plot_canon_a35_2 <- graph_top_canon_2(ipa_paths_a35, 5, "S35")
+plot_canon_a70_2 <- graph_top_canon_2(ipa_paths_a70, 5, "S70")
+plot_canon_mc_2 <- graph_top_canon_2(ipa_paths_mc, 5, "MC")
+plot_canon_uc_2 <- graph_top_canon_2(ipa_paths_uc, 5, "UC")
+
+ipa_canon_panel_2 <- plot_canon_a35_2 / plot_canon_a70_2 / plot_canon_mc_2 / plot_canon_uc_2
+
+pdf("3_OutputFigs/IPA_Canon_Panel.pdf",
+    width = 17, height = 17)
+ipa_canon_panel_2
+invisible(dev.off())
+```
+
+# Double checking for CD9, CD63, and CD81
+
+Alias search:
+```{r}
+cd9_aliases <- c("TSPAN29", "MIC3", "MRP1", "P24", "BA2", "5H9", "DRAP27", "BTCC1")
+cd63_aliases <- c("TSPAN30", "ME491", "PLTGP40", "HOP26", "LIMP1", "AD1", "LAMP3", "MLA1", "AD1")
+cd81_aliases <- c("TSPAN28", "TAPA1", "S5.7", "S5", "S57", "CVID6")
+
+data_filtered %>% filter(protein %in% cd9_aliases)
+data_filtered %>% filter(protein %in% cd63_aliases)
+data_filtered %>% filter(protein %in% cd81_aliases)
+```
+
+# Making final dataframe to export for supplemental material
+
+```{r}
+# First, clean up all data dataframe
+all_data_forsupp <- all_data %>%
+  select(-c(contaminant, modifications, contaminant:gocc_contains_exosome, number_peptides, 
+            number_ps_ms, number_a_as, pool_r1:pool_r3)) %>%
+  rename("Accession" = "accession", "Description" = "description", "Protein" = "protein", 
+         "Human_Exocarta" = "found_in_exocarta_database_human", "Human_Vescarta" = "found_in_vescarta_database_human",
+         "Coverage_Percent" = "coverage_percent", "Number_Unique_Peptides" = "number_unique_peptides",
+         "Molecular_Weight_kDa" = "mw_k_da") %>%
+  mutate(Present_AllSamps = ifelse(Accession %in% count_nomissing$accession == TRUE, "Yes", "No")) %>%
+  mutate(Passed_DetFilter = ifelse(Accession %in% keep_accession == TRUE, "Yes", "No")) %>%
+  relocate(c(Present_AllSamps, Passed_DetFilter), .after = "Molecular_Weight_kDa") %>%
+  rename_with(.fn = ~ to_screaming_snake_case(., sep_out = ""), .cols = h1_a35:h5_uc) %>%
+  rename_with(.fn = ~ sub("^(.{2})", "\\1_", .), .cols = H1A35:H5UC) %>%
+  rename_with(.fn = ~gsub("A35", "S35", .), .cols = H1_A35:H5_UC) %>%
+  rename_with(.fn = ~gsub("A70", "S70", .), .cols = H1_S35:H5_UC) %>%
+  rename_with(.fn = ~gsub("H4", "H2", .), .cols = H1_S35:H5_UC) %>%
+  rename_with(.fn = ~gsub("H5", "H3", .), .cols = H1_S35:H5_UC)
+
+# Add _imp to the imputed dataframe
+data_imp_forsupp <- data_filtered_imp %>%
+  t() %>% data.frame() %>%
+  rename_with(.fn = ~ to_screaming_snake_case(., sep_out = ""), .cols = h1_a35:h5_uc) %>%
+  rename_with(.fn = ~ sub("^(.{2})", "\\1_", .), .cols = H1A35:H5UC) %>%
+  rename_with(.fn = ~gsub("A35", "S35", .), .cols = H1_A35:H5_UC) %>%
+  rename_with(.fn = ~gsub("A70", "S70", .), .cols = H1_S35:H5_UC) %>%
+  rename_with(.fn = ~gsub("H4", "H2", .), .cols = H1_S35:H5_UC) %>%
+  rename_with(.fn = ~gsub("H5", "H3", .), .cols = H1_S35:H5_UC) %>%
+  rename_with(~paste0(., "_imp")) %>%
+  mutate(across(everything(), \(x) round(x, digits = 0))) %>%
+  rownames_to_column("Accession")
+
+# All data
+write.xlsx(all_data_forsupp, "2_OutputTables/Protein_Data_ForSupp_All.xlsx")
+
+# Filtered data
+filtered_data_forsupp <- all_data_forsupp %>%
+  right_join(data_imp_forsupp, by = "Accession")
+
+write.xlsx(filtered_data_forsupp, "2_OutputTables/Protein_Data_ForSupp_Filtered.xlsx")
+```
+
