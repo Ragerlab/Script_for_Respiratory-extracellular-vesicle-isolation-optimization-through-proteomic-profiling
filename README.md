@@ -1,8 +1,6 @@
-# Respiratory extracellular vesicle isolation optimization through proteomic profiling of equine samples and identification of candidates for cell-of-origin studies
-
 This repository contains script associated with the manuscript "Respiratory extracellular vesicle isolation optimization through proteomic profiling of equine samples and identification of candidates for cell-of-origin studies" published in the PLOS ONE journal in 2025. 
 
-Hickman E, Carberry V, Carberry C, Cooper B, Mordant AL, Mills A, Sokolsky M, Herring LE, Alexis NE, Rebuli ME, Jaspers I, Sheats K, Rager JE. Respiratory extracellular vesicle isolation optimization through proteomic profiling of equine samples and identification of candidates for cell-of-origin studies. PLoS One. 2025 Jan 24;20(1):e0315743. doi: 10.1371/journal.pone.0315743. PMID: 39854355; PMCID: PMC11760557.
++ Hickman E, Carberry V, Carberry C, Cooper B, Mordant AL, Mills A, Sokolsky M, Herring LE, Alexis NE, Rebuli ME, Jaspers I, Sheats K, Rager JE. Respiratory extracellular vesicle isolation optimization through proteomic profiling of equine samples and identification of candidates for cell-of-origin studies. PLoS One. 2025 Jan 24;20(1):e0315743. doi: 10.1371/journal.pone.0315743. PMID: 39854355; PMCID: PMC11760557.
 
 Script author: Elise Hickman, PhD (ehickman@email.unc.edu)
 
